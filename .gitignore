@@ -1,0 +1,5 @@
+.env
+artifacts/
+test-results/
+__pycache__/
+.DS_Store

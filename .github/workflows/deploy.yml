@@ -1,0 +1,128 @@
+name: Full Stack Deployment Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  COMPOSE_PROJECT_NAME: myapp
+
+jobs:
+  deploy-and-test:
+    # Критерий 1: job выполняется на self-hosted runner (macOS)
+    runs-on: self-hosted
+
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Runner info
+        run: |
+          echo "Runner: $RUNNER_NAME | OS: $RUNNER_OS | Arch: $RUNNER_ARCH"
+          docker --version
+          docker compose version
+
+      # Критерий 3: секреты подставляются в .env
+      - name: Create .env file from secrets
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          APP_PORT: ${{ secrets.APP_PORT }}
+        run: |
+          # Убираем пробелы и переносы строк, случайно попавшие в значения секретов
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+          : > .env
+          for k in DB_HOST DB_PORT DB_NAME DB_USER DB_PASSWORD APP_PORT; do
+            v=$(trim "${!k}")
+            if [ -z "$v" ]; then echo "❌ Секрет $k не задан"; exit 1; fi
+            echo "$k=$v" >> .env
+          done
+          echo "COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}" >> .env
+          mkdir -p artifacts
+          # Копия .env БЕЗ значений — для артефактов
+          sed 's/=.*/=***/' .env > artifacts/env-masked.txt
+          echo "✅ .env создан. Ключи:"
+          cat artifacts/env-masked.txt
+
+      - name: Validate compose file
+        run: docker compose config -q && echo "✅ docker-compose.yml валиден"
+
+      # Критерий 2: docker compose up -d
+      - name: Deploy with Docker Compose
+        run: |
+          set -a; . ./.env; set +a
+          docker compose down -v --remove-orphans || true
+          if ! docker compose up -d --build; then
+            echo "❌ Не удалось поднять стек, логи БД:"
+            docker compose logs --no-color db | tail -40
+            exit 1
+          fi
+          echo "⏳ Жду готовности приложения..."
+          for i in $(seq 1 30); do
+            if curl -fs "http://localhost:${APP_PORT}/health" > /dev/null; then
+              echo "✅ Приложение поднялось за $((i*2)) сек"; break
+            fi
+            sleep 2
+          done
+          docker compose ps
+
+      - name: Verify containers are running
+        run: |
+          RUNNING=$(docker compose ps --status running --services | wc -l | tr -d ' ')
+          echo "Запущено сервисов: $RUNNING из 2"
+          if [ "$RUNNING" -eq 2 ]; then
+            echo "✅ Все контейнеры работают"
+          else
+            echo "❌ Не все контейнеры запущены"
+            docker compose logs
+            exit 1
+          fi
+
+      - name: Check image (multi-stage, size, non-root)
+        run: |
+          docker image ls app-backend:1.0.0
+          echo "User: $(docker image inspect app-backend:1.0.0 --format '{{.Config.User}}')"
+
+      # Критерий 4: тесты приложения и сравнение БД с веб-интерфейсом
+      - name: Run application tests
+        run: |
+          set -a; . ./.env; set +a
+          bash tests/run_tests.sh
+
+      # Логи собираем ДО загрузки артефактов и даже при падении
+      - name: Collect logs and Docker state
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker compose logs --no-color > artifacts/deployment-logs.txt 2>&1 || true
+          docker compose ps -a > artifacts/docker-ps.txt 2>&1 || true
+          docker images > artifacts/docker-images.txt 2>&1 || true
+          cp -r test-results artifacts/ 2>/dev/null || true
+
+      # Критерий 3: артефакты сохраняются
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 30
+
+      - name: Final summary
+        run: |
+          APP_PORT=$(grep '^APP_PORT=' .env 2>/dev/null | cut -d= -f2)
+          echo "🎯 Итог"
+          echo "✅ Self-Hosted Runner: $RUNNER_NAME"
+          echo "✅ Docker Compose: app + db запущены"
+          echo "✅ Secrets → .env, артефакты загружены"
+          echo "✅ Тесты пройдены"
+          echo "🌐 Приложение: http://localhost:${APP_PORT}"
+
+      - name: Remove .env with real secrets
+        if: always()
+        run: rm -f .env
